@@ -50,6 +50,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+# Strata-Qwen36 (this fork): its own settings folder and data folder, so it installs and runs next to an upstream
+# Strata on the same PC without either one adopting the other's files (see other_installs)
+APP_DIR = "Strata-Qwen36"                  # %APPDATA%\Strata-Qwen36, ~/.config/strata-qwen36
+DATA_DIR = "Strata-Qwen36-data"            # the model files, next to this folder
+INSTALL_MARK = "setup_qwen36.py"           # a folder with this file is an install of this fork
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -1407,8 +1412,8 @@ def confirm_paging(model, ram, choice, yes):
 
 def settings_path() -> Path:
     if WIN:
-        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Strata" / "settings.json"
-    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "strata" / "settings.json"
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / APP_DIR / "settings.json"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP_DIR.lower() / "settings.json"
 
 
 def load_settings() -> dict:
@@ -1452,7 +1457,7 @@ def other_installs(settings: dict) -> list:
     for d in cands:
         try:
             d = d.resolve()
-            if d != ROOT and d not in found and (d / "setup.py").is_file():
+            if d != ROOT and d not in found and (d / INSTALL_MARK).is_file():
                 found.append(d)
         except OSError:
             pass
@@ -1520,7 +1525,7 @@ def data_folder(requested: str | None) -> tuple:
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
     dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / DATA_DIR
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
@@ -1532,7 +1537,7 @@ def data_folder(requested: str | None) -> tuple:
     sources = [ROOT, *other_installs(settings)]
     if settings.get("data_dir") and Path(settings["data_dir"]) != dest:
         sources.append(Path(settings["data_dir"]))
-    sources += [f / "Strata-data" for f in list(sources) if (f / "Strata-data") != dest]
+    sources += [f / DATA_DIR for f in list(sources) if (f / DATA_DIR) != dest]
     seen = set()
     for folder in sources:
         key = os.path.normcase(str(folder))
@@ -2499,7 +2504,13 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        # Strata-Qwen36: START-HERE / setup.sh set up and start Qwen3.6-35B-A3B (setup_qwen36.py); --flash-next runs
+        # upstream's setup for Qwen3.8-Flash-Next instead (with this fork's folders)
+        if "--flash-next" in sys.argv:
+            sys.argv.remove("--flash-next")
+            sys.exit(main())
+        import setup_qwen36
+        sys.exit(setup_qwen36.main())
     except KeyboardInterrupt:
         say("\nstopped.")
         sys.exit(1)

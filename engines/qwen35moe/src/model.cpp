@@ -209,7 +209,6 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     CUDA_CHECK(cudaMalloc(&dev_arena_, dev_cap_));
     dense_bytes = dev_cap_;
 
-    tok_embd = te.data;
     tok_embd_type = te.type;
     tok_embd_row_bytes = row_bytes(te.type, c.n_embd);
     SQ_CHECK(te.type == T_Q8_0 || te.type == T_F32 || te.type == T_F16 || te.type == T_Q6_K || te.type == T_Q4_K ||
@@ -306,6 +305,13 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
             std::memcpy(dst + 2 * L.gu_bytes, d + e * L.down_bytes, (size_t)L.down_bytes);
         }, 16);
     }
+    // Everything the engine needs from the file is copied now, so the mapping is closed: it would otherwise keep the
+    // ~20 GB of pages the load touched in this process's working set (reclaimable, but counted as used RAM and
+    // pushing other programs out).  The embedding is the one tensor still read per token: a copy of it stays.
+    const GgufTensor& emb = gguf.need("token_embd.weight");
+    tok_embd_copy_.assign(emb.data, emb.data + (size_t)tok_embd_row_bytes * c.n_vocab);
+    tok_embd = tok_embd_copy_.data();
+    gguf.close();
     const double secs = (now_ms() - t1) / 1000;
     log("experts loaded %.2f GiB at %.1f GiB/s (%.1f s)", expert_bytes / 1073741824.0,
         secs > 0 ? expert_bytes / 1073741824.0 / secs : 0.0, secs);

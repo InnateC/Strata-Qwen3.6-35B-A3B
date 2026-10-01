@@ -35,6 +35,8 @@ public:
     GgufFile& operator=(const GgufFile&) = delete;
 
     bool open(const std::string& path, std::string& err);
+    /// Unmaps the file (the metadata stays readable; tensor data pointers become null).
+    void close();
 
     const GgufTensor* tensor(const std::string& name) const;
     const GgufTensor& need(const std::string& name) const;

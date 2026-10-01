@@ -49,3 +49,7 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# Strata-Qwen36: the qwen35moe engine setup_qwen36.py compiles
+/engine-qwen35moe/
+/build-qwen35moe.bat

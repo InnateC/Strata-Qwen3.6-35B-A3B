@@ -106,7 +106,7 @@ public:
     MtpW mtp;
     const float* output_norm = nullptr;
     DQ8 lm_head;
-    // token embedding stays in the mapped file (Q8_0 rows of n_embd)
+    // the token embedding, copied out of the file (rows of n_embd in the GGUF's type; one is dequantized per token)
     const uint8_t* tok_embd = nullptr;
     uint32_t tok_embd_type = 0;
     int64_t tok_embd_row_bytes = 0;
@@ -125,6 +125,7 @@ private:
     uint8_t* dev_arena_ = nullptr;
     int64_t dev_used_ = 0, dev_cap_ = 0;
     std::vector<uint8_t*> pinned_;
+    std::vector<uint8_t> tok_embd_copy_;
     void* dev_alloc(int64_t bytes);
     DQ8 upload_q8(const std::vector<const GgufTensor*>& parts);
     DF32 upload_f32(const std::vector<const GgufTensor*>& parts);

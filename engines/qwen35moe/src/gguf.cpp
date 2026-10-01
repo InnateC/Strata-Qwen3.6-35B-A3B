@@ -62,15 +62,21 @@ double read_num(Cursor& c, uint32_t t) {
 
 }  // namespace
 
-GgufFile::~GgufFile() {
+GgufFile::~GgufFile() { close(); }
+
+void GgufFile::close() {
 #ifdef _WIN32
     if (base_) UnmapViewOfFile(base_);
     if (hmap_) CloseHandle((HANDLE)hmap_);
     if (hfile_) CloseHandle((HANDLE)hfile_);
 #else
     if (base_) munmap((void*)base_, size_);
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) ::close(fd_);
 #endif
+    base_ = nullptr;
+    hmap_ = hfile_ = nullptr;
+    fd_ = -1;
+    for (auto& t : tensors_) t.data = nullptr;
 }
 
 bool GgufFile::open(const std::string& path, std::string& err) {

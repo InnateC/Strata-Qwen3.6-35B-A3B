@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 
 namespace sq {
@@ -194,6 +195,27 @@ inline void dequant_row(uint32_t type, const void* src, float* y, int64_t n) {
         case T_Q5_K: dequant_q5_K(src, y, n); break;
         case T_Q6_K: dequant_q6_K(src, y, n); break;
         default: break;
+    }
+}
+
+/// True for the types dequant_row() handles.
+inline bool can_dequant(uint32_t type) {
+    switch (type) {
+        case T_F32: case T_F16: case T_BF16: case T_Q8_0: case T_Q4_K: case T_Q5_K: case T_Q6_K: return true;
+        default: return false;
+    }
+}
+
+/// ggml's reference Q8_0 quantizer (quantize_row_q8_0_ref), into the GPU's split layout: n int8 quants and n/32
+/// fp16 scales.
+inline void quantize_row_q8_0(const float* x, int8_t* qs, uint16_t* d, int64_t n) {
+    for (int64_t i = 0; i < n / 32; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[i * 32 + j]));
+        const float dd = amax / 127.0f;
+        const float id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        d[i] = f32_to_fp16(dd);
+        for (int j = 0; j < 32; ++j) qs[i * 32 + j] = (int8_t)std::lround(x[i * 32 + j] * id);
     }
 }
 

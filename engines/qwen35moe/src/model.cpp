@@ -54,8 +54,11 @@ DQ8 Model::upload_q8(const std::vector<const GgufTensor*>& parts) {
     const int64_t cols = parts[0]->ne[0];
     int64_t rows = 0;
     for (auto* t : parts) {
-        SQ_CHECK(t->type == T_Q8_0, "%s: expected Q8_0, got %s", t->name.c_str(), type_name(t->type));
-        SQ_CHECK(t->ne[0] == cols, "%s: column mismatch", t->name.c_str());
+        // Q8_0 is copied as stored; any other type the dequantizer knows (Q4_K..Q6_K, F16, BF16, F32 - the dense
+        // tensors of the other quantizations, e.g. Q4_K_M's Q6_K output head) is converted to Q8_0 at load
+        SQ_CHECK(t->type == T_Q8_0 || can_dequant(t->type), "%s: unsupported type %s", t->name.c_str(),
+                 type_name(t->type));
+        SQ_CHECK(t->ne[0] == cols && cols % 32 == 0, "%s: column mismatch", t->name.c_str());
         rows += t->n_elements() / cols;
     }
     const int64_t nb = cols / 32;
@@ -64,16 +67,26 @@ DQ8 Model::upload_q8(const std::vector<const GgufTensor*>& parts) {
     int64_t r0 = 0;
     for (auto* t : parts) {
         const int64_t tr = t->n_elements() / cols;
-        const BlockQ8_0* src = (const BlockQ8_0*)t->data;
-        parallel_for(tr, [&](int64_t r) {
-            const BlockQ8_0* b = src + r * nb;
-            int8_t* q = qs.data() + (r0 + r) * cols;
-            uint16_t* dd = d.data() + (r0 + r) * nb;
-            for (int64_t i = 0; i < nb; ++i) {
-                dd[i] = b[i].d;
-                std::memcpy(q + i * 32, b[i].qs, 32);
-            }
-        });
+        if (t->type == T_Q8_0) {
+            const BlockQ8_0* src = (const BlockQ8_0*)t->data;
+            parallel_for(tr, [&](int64_t r) {
+                const BlockQ8_0* b = src + r * nb;
+                int8_t* q = qs.data() + (r0 + r) * cols;
+                uint16_t* dd = d.data() + (r0 + r) * nb;
+                for (int64_t i = 0; i < nb; ++i) {
+                    dd[i] = b[i].d;
+                    std::memcpy(q + i * 32, b[i].qs, 32);
+                }
+            });
+        } else {
+            const int64_t rb = row_bytes(t->type, cols);
+            parallel_for(tr, [&](int64_t r) {
+                std::vector<float> f((size_t)cols);
+                dequant_row(t->type, t->data + r * rb, f.data(), cols);
+                quantize_row_q8_0(f.data(), qs.data() + (r0 + r) * cols, d.data() + (r0 + r) * nb, cols);
+            });
+            log("%s: %s converted to Q8_0 for the GPU", t->name.c_str(), type_name(t->type));
+        }
         r0 += tr;
     }
     DQ8 m;
@@ -116,9 +129,16 @@ DF32 Model::upload_f32(const std::vector<const GgufTensor*>& parts) {
 }
 
 const float* Model::upload_vec(const GgufTensor& t) {
-    SQ_CHECK(t.type == T_F32, "%s: expected F32", t.name.c_str());
+    SQ_CHECK(t.type == T_F32 || t.type == T_F16 || t.type == T_BF16, "%s: expected F32, got %s", t.name.c_str(),
+             type_name(t.type));
     float* w = (float*)dev_alloc(t.n_elements() * 4);
-    CUDA_CHECK(cudaMemcpy(w, t.data, t.n_elements() * 4, cudaMemcpyHostToDevice));
+    if (t.type == T_F32) {
+        CUDA_CHECK(cudaMemcpy(w, t.data, t.n_elements() * 4, cudaMemcpyHostToDevice));
+    } else {
+        std::vector<float> f((size_t)t.n_elements());
+        dequant_row(t.type, t.data, f.data(), t.n_elements());
+        CUDA_CHECK(cudaMemcpy(w, f.data(), f.size() * 4, cudaMemcpyHostToDevice));
+    }
     return w;
 }
 

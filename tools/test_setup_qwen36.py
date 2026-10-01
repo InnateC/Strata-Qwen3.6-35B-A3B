@@ -65,5 +65,41 @@ class Models(unittest.TestCase):
         self.assertTrue(all(c <= 262144 for c in Q.CONTEXTS))
 
 
+class EffortBudgets(unittest.TestCase):
+    """serve/server.py's effort_budget: Qwen3.6's template has no reasoning levels, so the config maps them to thinking
+    budgets; without the config nothing changes (upstream's models keep their template's levels)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from serve.frontend import ChatTemplate
+        from serve.server import ByteTokenizer, MockEngine, Service
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def tearDown(self):
+        self.svc.effort_budgets = {}
+        self.svc.reasoning_budget_tokens = 0
+
+    def test_off_without_config(self):
+        self.assertIsNone(self.svc.reasoning_budget({"reasoning_effort": "low"}))
+
+    def test_levels(self):
+        self.svc.effort_budgets = dict(Q.EFFORT_BUDGETS)
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_effort": "low"}), 1024)
+        self.assertEqual(self.svc.reasoning_budget({"reasoning": {"effort": "Medium"}}), 4096)
+        self.assertIsNone(self.svc.reasoning_budget({"reasoning_effort": "high"}))
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_effort": "high",
+                                                    "chat_template_kwargs": {"reasoning_effort": "low"}}), 1024)
+        self.assertEqual(self.svc.reasoning_budget({"output_config": {"effort": "low"}}), 1024)
+        self.assertEqual(self.svc.reasoning_budget({"thinking": {"type": "enabled", "budget_tokens": 3000}}), 3000)
+
+    def test_explicit_budget_wins(self):
+        self.svc.effort_budgets = dict(Q.EFFORT_BUDGETS)
+        self.svc.reasoning_budget_tokens = 500
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_effort": "low", "reasoning_budget_tokens": 77}), 77)
+        self.assertEqual(self.svc.reasoning_budget({"reasoning_effort": "low"}), 1024)
+        self.assertEqual(self.svc.reasoning_budget({}), 500)
+
+
 if __name__ == "__main__":
     unittest.main()

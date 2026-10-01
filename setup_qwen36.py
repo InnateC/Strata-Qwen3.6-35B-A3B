@@ -55,6 +55,7 @@ MODELS = {
 }
 CONTEXTS = [8192, 32768, 65536, 131072, 262144]
 KV_BYTES_PER_TOKEN = 11 * 2 * 2 * 256 * 2   # (10 attention layers + the MTP layer) x K,V x 2 heads x 256 x fp16
+EFFORT_BUDGETS = {"low": 1024, "medium": 4096}   # thinking tokens per reasoning level (serve/server.py)
 DEFAULT_PORT = 8081                          # upstream Strata's is 8080: both can run at once
 EXE = "strata-qwen35moe.exe" if WIN else "strata-qwen35moe"
 ENGINE_DIR = ROOT / "engine-qwen35moe"
@@ -334,7 +335,9 @@ def main() -> int:
             "--max-context", str(ctx), "--threads", str(threads)]
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"qwen3.6-35b-a3b-{model.lower()}" if not a.gguf else gguf.stem.lower(),
-           "log": str(ROOT / f"strata-{name}.log"), "lib_dirs": meta.get("cuda_dirs") or [], "port": port}
+           "log": str(ROOT / f"strata-{name}.log"), "lib_dirs": meta.get("cuda_dirs") or [], "port": port,
+           # Qwen3.6's template thinks or does not: the web app's low / medium become thinking budgets (high: none)
+           "reasoning_budget_by_effort": old.get("reasoning_budget_by_effort", EFFORT_BUDGETS)}
     if gpu["count"] > 1:
         cfg["gpu"] = gpu["index"]                       # the server tells the engine this card (CUDA_VISIBLE_DEVICES)
     for k in ("host", "api_key"):

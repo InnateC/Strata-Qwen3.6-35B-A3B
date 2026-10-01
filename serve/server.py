@@ -655,6 +655,7 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.effort_budgets = {}                         # Strata-Qwen36: reasoning levels as thinking budgets
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -667,12 +668,28 @@ class Service:
         anything that is not a whole number."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
         if value is None:
+            value = self.effort_budget(req)
+        if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
+
+    def effort_budget(self, req) -> int | None:
+        """Strata-Qwen36: a model whose template thinks or does not, without levels (Qwen3.6), gets the request's level
+        as a thinking budget instead - the config's "reasoning_budget_by_effort", e.g. {"low": 1024, "medium": 4096}
+        (a level it leaves out thinks without a budget) - and an Anthropic request's budget_tokens as it is.  None
+        without that config, so other models keep their template's levels."""
+        if not self.effort_budgets or not isinstance(req, dict):
+            return None
+        part = lambda k: req.get(k) if isinstance(req.get(k), dict) else {}   # noqa: E731
+        thinking, out_cfg = part("thinking"), part("output_config")
+        if thinking.get("type") == "enabled" and not out_cfg.get("effort") and                 isinstance(thinking.get("budget_tokens"), int) and not isinstance(thinking.get("budget_tokens"), bool):
+            return thinking["budget_tokens"]
+        effort = part("chat_template_kwargs").get("reasoning_effort") or req.get("reasoning_effort") or             part("reasoning").get("effort") or out_cfg.get("effort")
+        return self.effort_budgets.get(str(effort).strip().lower()) if effort else None
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -2036,6 +2053,14 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    budgets = cfg.get("reasoning_budget_by_effort") or {}   # Strata-Qwen36: levels as thinking budgets (effort_budget)
+    if not isinstance(budgets, dict) or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                                                for v in budgets.values()):
+        raise SystemExit(f"[strata] config reasoning_budget_by_effort={budgets!r}: expected {{level: tokens}}")
+    svc.effort_budgets = {str(k).lower(): v for k, v in budgets.items()}
+    if svc.effort_budgets:
+        print("[strata] thinking levels as budgets: " + ", ".join(f"{k} {v} tokens" for k, v in svc.effort_budgets.items()),
+              flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.config:                                        # the Chat settings shared with other apps, from last time

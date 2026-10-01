@@ -1,24 +1,36 @@
 // main.cpp - command line: benchmark / greedy generation from token ids / the --serve line protocol.
 //
-//   strataq -m model.gguf --ids 1,2,3 -n 64            greedy continuation, prints ids and speed
-//   strataq -m model.gguf --bench                       prefill + decode benchmark on a synthetic prompt
-//   strataq -m model.gguf --serve                       stdin/stdout protocol used by serve/server.py
-//   strataq -m model.gguf --ids 1,2,3 -n 64 --spec-check   greedy with and without MTP drafts must agree
+//   strata-qwen35moe -m model.gguf --ids 1,2,3 -n 64            greedy continuation, prints ids and speed
+//   strata-qwen35moe -m model.gguf --bench                       prefill + decode benchmark on a synthetic prompt
+//   strata-qwen35moe -m model.gguf --serve                       Strata's engine protocol (serve/server.py)
+//   strata-qwen35moe -m model.gguf --ids 1,2,3 -n 64 --spec-check   greedy with and without MTP drafts must agree
 //
-// Protocol (one line each way; logs go to stderr):
-//   -> GEN max_new=N temp=T top_k=K top_p=P min_p=M pres=X freq=Y rep=R seed=S stop=a,b [ckpt=p,q] [draft=D] ids=1,2,3
-//      (ckpt: extra prompt positions to checkpoint for prefix reuse; the end of the prompt always is;
-//       draft: MTP drafts per step for this request, default the --mtp value)
-//   <- PROG done total            (prompt processing progress)
-//   <- TOK id                     (each generated token)
-//   <- DONE n_prompt=.. n_reused=.. n_gen=.. prefill_ms=.. decode_ms=.. reason=stop|length|cancel|error
-//   -> STOP                       (cancel the running generation)
-//   -> STATS / SAVEPROFILE path / RESET / QUIT
+// --serve speaks the protocol of Strata's own engine (src/program/generate.cpp), so serve/server.py, the web app
+// and the tools drive this engine unchanged.  One line each way; logs go to stderr:
+//   <- INFO key=value ...             facts for the Monitor tab (context, kv, expert_slots, ...), before READY
+//   <- READY <context> stop            ready; "stop": a STOP line ends the running request
+//   -> GEN <max_new> [key=value ...] <id,id,...>
+//        keys: temperature top_p top_k min_p penalty_last_n penalty_repeat penalty_freq penalty_present seed;
+//        unknown keys are skipped (the ids start at the first token without '=')
+//   <- PP <position reached> <prompt tokens> <ms> <fresh tokens/s>   once per prompt slice
+//   <- T <id>                          each generated token (an end-of-turn token is sent, then the request ends)
+//   <- DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel> <drafts accepted> <drafts offered>
+//           <reused> <expert hits> <expert lookups> <RAM experts> <file experts> <file MB>
+//   <- ERR <message>                   the request was refused
+//   -> STOP                            end the running request (finish "cancel")
+//   -> QUIT                            save the expert profile (--profile-save) and exit
+//
+// Prefix reuse: the delta-net state cannot be rolled back, so the engine checkpoints positions a follow-up request
+// is likely to resume from - the end of the prompt, the start of its last turn (Qwen's template drops the reasoning
+// of earlier turns, so the next request diverges right after it) and the end of the first (system) message.
 #include "common.hpp"
 #include "engine.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -35,9 +47,16 @@
 #include <windows.h>
 #endif
 
+#ifndef SQ_VERSION
+#define SQ_VERSION "0.0.0"
+#endif
+
 using namespace sq;
 
 namespace {
+
+// the qwen35 vocabulary's turn markers (Qwen3.5 / Qwen3.6 GGUFs; --eos-ids overrides the end-of-turn ids)
+constexpr int kImStart = 248045, kImEnd = 248046, kEndOfText = 248044, kNewline = 198;
 
 std::vector<int> parse_ids(const std::string& s) {
     std::vector<int> v;
@@ -50,65 +69,32 @@ std::vector<int> parse_ids(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-        "usage: strataq -m MODEL.gguf [options]\n"
-        "  --ctx N            context length (default 32768)\n"
+        "usage: strata-qwen35moe -m MODEL.gguf [options]\n"
+        "  --max-context N    context length (default 32768; also --ctx)\n"
         "  --threads N        CPU expert threads (default 8)\n"
-        "  --reserve-mb N     VRAM left free once ready (default 1200)\n"
+        "  --vram-reserve-mib N  VRAM left free once ready (default 1200; also --reserve-mb)\n"
         "  --cache-mb N       cap the VRAM expert cache\n"
-        "  --profile FILE     expert routing profile (default data/expert_profile.bin)\n"
+        "  --expert-profile FILE  expert routing profile (default data/expert-profile-qwen36.bin; also --profile)\n"
+        "  --profile-save FILE    keep the profile plus this run's routing here (read instead of --expert-profile\n"
+        "                     when it exists; written on QUIT and after requests)\n"
         "  --no-graph         launch kernels one by one (debug)\n"
         "  --no-adapt         keep the expert cache fixed\n"
         "  --adapt-every N --adapt-swaps M   re-rank the cache every N tokens, swapping up to M experts\n"
         "  --profile-weight W weight of the profile against live routing (default 1)\n"
         "  --prefill-chunk N  tokens per prefill pass (default 4096; smaller leaves more VRAM for experts)\n"
-        "  --mtp N            speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
-        "                     max 3; 0 = off and the MTP block is not loaded)\n"
+        "  --ckpt-slots N     prefix-reuse checkpoints (default 3, ~66 MiB of VRAM each)\n"
+        "  --mtp-draft N      speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
+        "                     max 3; 0 = off and the MTP block is not loaded; also --mtp)\n"
         "  --draft-p P        keep drafting while the MTP's probability of the drafts so far is >= P (default 0.8)\n"
+        "  --eos-ids a,b      end-of-turn token ids for --serve (default 248044,248046)\n"
         "  --ids a,b,c|@file -n N   generation from token ids (greedy unless --temp)\n"
         "  --temp T --top-k K --top-p P --pres X --seed S   sampling for --ids / --bench\n"
         "  --dump-logits F    write the logits after --ids to F (float32)\n"
         "  --bench [--bench-prompt N] [-n N]\n"
         "  --selfcheck N      logits of a random N-token prompt: batched prefill vs prefill(N-1) + decode(1)\n"
         "  --spec-check       with --ids: greedy generation with MTP drafts vs without, token by token\n"
-        "  --serve            line protocol on stdin/stdout\n");
+        "  --serve            Strata's engine protocol on stdin/stdout\n");
 }
-
-struct LineReader {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::string> q;
-    bool eof = false;
-    std::thread th;
-    void start() {
-        th = std::thread([this] {
-            std::string line;
-            while (std::getline(std::cin, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                std::lock_guard<std::mutex> lk(m);
-                q.push_back(line);
-                cv.notify_all();
-            }
-            std::lock_guard<std::mutex> lk(m);
-            eof = true;
-            cv.notify_all();
-        });
-        th.detach();
-    }
-    bool next(std::string& out) {
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return !q.empty() || eof; });
-        if (q.empty()) return false;
-        out = q.front();
-        q.pop_front();
-        return true;
-    }
-    bool poll_stop() {   // consumes a pending STOP
-        std::lock_guard<std::mutex> lk(m);
-        for (auto it = q.begin(); it != q.end(); ++it)
-            if (*it == "STOP") { q.erase(it); return true; }
-        return false;
-    }
-};
 
 void emit(const char* fmt, ...) {
     va_list ap;
@@ -119,104 +105,191 @@ void emit(const char* fmt, ...) {
     std::fflush(stdout);
 }
 
-int serve(Engine& eng) {
-    const int default_draft = eng.mtp_draft();
+struct ServeOptions {
+    std::vector<int> eos = {kEndOfText, kImEnd};
+    std::string profile_save;
+};
+
+/// The sampling keys of a GEN line, Strata's spelling.  `p` points after max_new; on return it points at the ids.
+void parse_keys(const char*& p, SamplingParams& sp) {
+    for (;;) {
+        while (*p == ' ') ++p;
+        const char* start = p;
+        while (*p != '\0' && *p != ' ') ++p;
+        if (p == start) return;
+        const std::string tok(start, (size_t)(p - start));
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos) { p = start; return; }
+        const std::string k = tok.substr(0, eq);
+        const char* v = tok.c_str() + eq + 1;
+        if (k == "temperature") sp.temperature = std::strtof(v, nullptr);
+        else if (k == "top_p") sp.top_p = std::strtof(v, nullptr);
+        else if (k == "top_k") sp.top_k = std::atoi(v);
+        else if (k == "min_p") sp.min_p = std::strtof(v, nullptr);
+        else if (k == "penalty_last_n") sp.penalty_last_n = std::atoi(v);
+        else if (k == "penalty_repeat") sp.repetition_penalty = std::strtof(v, nullptr);
+        else if (k == "penalty_freq") sp.frequency_penalty = std::strtof(v, nullptr);
+        else if (k == "penalty_present") sp.presence_penalty = std::strtof(v, nullptr);
+        else if (k == "seed") sp.seed = std::strtoull(v, nullptr, 10);
+        // pcie_frac, spec_min_p, cvec: settings of Strata's own engine that this one does not have
+    }
+}
+
+int serve(Engine& eng, const ServeOptions& so) {
 #ifdef _WIN32
-    // Ctrl+C in the console reaches every process in it: let the server (our parent) handle it, save the profile
-    // and close our stdin, which ends this loop.
+    // Ctrl+C in the console reaches every process in it: the server (our parent) handles it and sends QUIT
     SetConsoleCtrlHandler(nullptr, TRUE);
 #endif
-    LineReader rd;
-    rd.start();
-    emit("READY ctx=%d vocab=%d mtp=%d", eng.ctx(), eng.cfg().n_vocab, default_draft);
+    // stdin on its own thread: a STOP must be seen while a request runs
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::atomic<bool> stop_req{false};
+    std::thread([&] {
+        std::string l;
+        while (std::getline(std::cin, l)) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (l == "STOP") { stop_req.store(true); continue; }
+            std::lock_guard<std::mutex> lk(mu);
+            lines.push_back(l);
+            cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        eof = true;
+        cv.notify_one();
+    }).detach();
+    auto next_line = [&](std::string& out) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return !lines.empty() || eof; });
+        if (lines.empty()) return false;
+        out = std::move(lines.front());
+        lines.pop_front();
+        return true;
+    };
+    auto save_profile = [&] {
+        if (so.profile_save.empty()) return;
+        std::string err;
+        if (!eng.save_profile(so.profile_save, err)) log("strata-qwen35moe: %s", err.c_str());
+    };
+
+    const int ctx = eng.ctx(), vocab = eng.cfg().n_vocab;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    log("strata-qwen35moe: expert cache %lld slots, %.2f GiB; %lld MiB of VRAM free with everything loaded",
+        (long long)eng.cache_slots(), eng.cache_gib(), (long long)(free_b >> 20));
+    log("strata-qwen35moe: session is up");
+    emit("INFO context=%d kv=fp16 kv_resident=0 expert_slots=%lld expert_cache_mib=%lld expert_slots_primary=%lld "
+         "expert_cache_primary_mib=%lld spec=%d mtp_max=%d lookup=0 vram_free_mib=%lld arena_mib=%lld pool_workers=%d "
+         "conversation_cache_slots=%d engine=" SQ_VERSION "+qwen35moe",
+         ctx, (long long)eng.cache_slots(), (long long)(eng.cache_gib() * 1024), (long long)eng.cache_slots(),
+         (long long)(eng.cache_gib() * 1024), eng.mtp_draft() + 1, eng.mtp_draft() + 1, (long long)(free_b >> 20),
+         (long long)(eng.expert_arena_bytes() >> 20), eng.cpu_threads(), eng.ckpt_slots());
+    emit("READY %d stop", ctx);
+    using Clock = std::chrono::steady_clock;
+    auto last_save = Clock::now();
     std::string line;
-    while (rd.next(line)) {
+    while (next_line(line)) {
         if (line == "QUIT") break;
-        if (line == "STOP") continue;
-        if (line == "STATS") { emit("STATS %s", eng.status_line().c_str()); continue; }
-        if (line == "RESET") { eng.reset(); emit("OK"); continue; }
-        if (line.rfind("SAVEPROFILE ", 0) == 0) {
-            std::string err;
-            if (eng.save_profile(line.substr(12), err)) emit("OK");
-            else emit("ERR %s", err.c_str());
-            continue;
-        }
-        if (line.rfind("GEN ", 0) != 0) { emit("ERR unknown command"); continue; }
+        stop_req.store(false);   // a STOP between requests is stale
+        if (line == "STATS") { log("strata-qwen35moe: %s", eng.status_line().c_str()); continue; }
+        if (line.rfind("GENI ", 0) == 0) { emit("ERR this engine was started without --vision"); continue; }
+        if (line.rfind("GEN ", 0) != 0) { emit("ERR expected: GEN <max_new> <id,id,...>"); continue; }
+        const char* p = line.c_str() + 4;
+        char* endp = nullptr;
+        const long long max_new = std::strtoll(p, &endp, 10);
         SamplingParams sp;
-        int max_new = 256, draft = -1;
-        std::vector<int> ids, stop, ckpt;
-        std::stringstream ss(line.substr(4));
-        std::string kv;
-        while (ss >> kv) {
-            const size_t eq = kv.find('=');
-            if (eq == std::string::npos) continue;
-            const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
-            if (k == "max_new") max_new = std::stoi(v);
-            else if (k == "temp") sp.temperature = std::stof(v);
-            else if (k == "top_k") sp.top_k = std::stoi(v);
-            else if (k == "top_p") sp.top_p = std::stof(v);
-            else if (k == "min_p") sp.min_p = std::stof(v);
-            else if (k == "pres") sp.presence_penalty = std::stof(v);
-            else if (k == "freq") sp.frequency_penalty = std::stof(v);
-            else if (k == "rep") sp.repetition_penalty = std::stof(v);
-            else if (k == "seed") sp.seed = std::stoull(v);
-            else if (k == "stop") stop = parse_ids(v);
-            else if (k == "ids") ids = parse_ids(v);
-            else if (k == "ckpt") ckpt = parse_ids(v);
-            else if (k == "draft") draft = std::stoi(v);
-        }
-        if (ids.empty()) { emit("DONE n_prompt=0 n_reused=0 n_gen=0 prefill_ms=0 decode_ms=0 reason=error"); continue; }
-        if ((int)ids.size() >= eng.ctx()) {
-            emit("DONE n_prompt=%zu n_reused=0 n_gen=0 prefill_ms=0 decode_ms=0 reason=context", ids.size());
+        sp.top_k = 20;       // the sampled path's default, as in Strata's engine (requests normally set it)
+        sp.top_p = 1.0f;
+        p = endp;
+        parse_keys(p, sp);
+        if (sp.top_k < 1 || sp.top_k > kCand) sp.top_k = kCand;
+        std::vector<int> ids;
+        bool bad = max_new < 1;
+        try { ids = parse_ids(p); } catch (...) { bad = true; }
+        if (bad || ids.empty()) { emit("ERR bad request: max_new or ids"); continue; }
+        const int n = (int)ids.size();
+        if (n + max_new > ctx) {
+            emit("ERR prompt (%d tokens) + max_new (%lld) exceeds the context (%d)", n, max_new, ctx);
             continue;
         }
-        std::mt19937_64 rng(sp.seed ? sp.seed : (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
-        const double t0 = now_ms();
-        const int reused = eng.reuse_prefix(ids);
-        if (reused < (int)ids.size()) {
-            // feed in slices so the client sees progress on long prompts; stop at the requested checkpoints
-            const int total = (int)ids.size() - reused;
-            const int slice = 4096;
-            std::sort(ckpt.begin(), ckpt.end());
-            int pos = reused;
-            while (pos < (int)ids.size()) {
-                int end = std::min(pos + slice, (int)ids.size());
-                bool at_ckpt = false;
-                for (int c : ckpt)
-                    if (c > pos && c < end) { end = c; at_ckpt = true; break; }
-                    else if (c == end) at_ckpt = true;
-                eng.feed(ids.data() + pos, end - pos);
-                pos = end;
-                if (at_ckpt) eng.save_checkpoint();
-                emit("PROG %d %d", pos - reused, total);
-            }
-            eng.save_checkpoint();
+        if (std::any_of(ids.begin(), ids.end(), [&](int t) { return t < 0 || t >= vocab; })) {
+            emit("ERR a token id is outside the vocabulary");
+            continue;
         }
-        const double t1 = now_ms();
-        eng.begin_request();
-        eng.set_mtp_draft(draft < 0 ? default_draft : draft);
-        int n_gen = 0;
-        const char* reason = "length";
-        const int room = eng.ctx() - (int)ids.size();
-        max_new = std::min(max_new, room);
-        // Each round emits the tokens that follow the last emitted one: one sampled token, or with MTP the accepted
-        // drafts and the trunk's next token.  The last of them is not fed yet: spec_step feeds it.
+        std::mt19937_64 rng(sp.seed ? sp.seed : (uint64_t)Clock::now().time_since_epoch().count());
+        uint64_t hits0 = 0, miss0 = 0;
+        eng.expert_counts(hits0, miss0);
+        const uint64_t acc0 = eng.stats.accepted, off0 = eng.stats.drafted;
+
+        // ---- the prompt: what a checkpoint or the live state already holds, then the rest in slices
+        const auto t0 = Clock::now();
+        const int reused = eng.reuse_prefix(ids);
+        std::vector<int> cks;
+        int base_ck = -1;   // the end of the first (system) message: its own checkpoint slot
+        auto add_ck = [&](int pos) { if (pos > reused && pos < n) cks.push_back(pos); };
+        for (int i = n - 1; i >= 0; --i)
+            if (ids[i] == kImStart) { add_ck(i); break; }
+        if (ids[0] == kImStart)
+            for (int i = 1; i < n; ++i)
+                if (ids[i] == kImEnd) {
+                    base_ck = i + 1 < n && ids[i + 1] == kNewline ? i + 2 : i + 1;
+                    add_ck(base_ck);
+                    break;
+                }
+        std::sort(cks.begin(), cks.end());
+        int pos = reused;
+        while (pos < n) {
+            int end = std::min(pos + 4096, n);
+            for (int c : cks)
+                if (c > pos && c < end) { end = c; break; }
+            eng.feed(ids.data() + pos, end - pos);
+            pos = end;
+            if (std::find(cks.begin(), cks.end(), pos) != cks.end()) eng.save_checkpoint(pos == base_ck);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            emit("PP %d %d %.0f %.1f", pos, n, ms, ms > 0 ? 1000.0 * (pos - reused) / ms : 0.0);
+        }
+        if (reused < n) eng.save_checkpoint();
+        const auto t1 = Clock::now();
+
+        // ---- the answer: each round emits the tokens after the last one emitted (one sampled token, or with MTP the
+        // accepted drafts and the trunk's next token); the last of them is fed by the next round
+        eng.begin_request(sp);
+        long long produced = 0;
+        const char* finish = "length";
         std::vector<int> next{eng.sample(sp, rng)};
-        while (max_new > 0) {
-            bool finished = false;
-            for (const int tok : next) {
-                emit("TOK %d", tok);
-                if (std::find(stop.begin(), stop.end(), tok) != stop.end()) { reason = "stop"; finished = true; break; }
-                if (++n_gen >= max_new) { finished = true; break; }
+        for (bool done = false; !done;) {
+            for (int tok : next) {
+                emit("T %d", tok);
+                ++produced;
+                if (std::find(so.eos.begin(), so.eos.end(), tok) != so.eos.end()) { finish = "stop"; done = true; break; }
+                if (produced >= max_new) { done = true; break; }
             }
-            if (finished) break;
-            if (rd.poll_stop()) { reason = "cancel"; break; }
+            if (done) break;
+            if (stop_req.load()) { finish = "cancel"; break; }
             eng.spec_step(next.back(), sp, rng, next);
         }
-        const double t2 = now_ms();
-        emit("DONE n_prompt=%zu n_reused=%d n_gen=%d prefill_ms=%.1f decode_ms=%.1f reason=%s", ids.size(), reused, n_gen,
-             t1 - t0, t2 - t1, reason);
+        const auto t2 = Clock::now();
+        const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        uint64_t hits = 0, miss = 0;
+        eng.expert_counts(hits, miss);
+        hits -= hits0;
+        miss -= miss0;
+        emit("DONE %lld %d %.1f %.1f %s %llu %llu %d %llu %llu %llu 0 0.0", produced, n, prompt_ms, decode_ms, finish,
+             (unsigned long long)(eng.stats.accepted - acc0), (unsigned long long)(eng.stats.drafted - off0), reused,
+             (unsigned long long)hits, (unsigned long long)(hits + miss), (unsigned long long)miss);
+        log("strata-qwen35moe: prompt %d tokens = %d reused + %d read in %.0f ms (%.1f tok/s), %lld generated in %.0f ms "
+            "(%.1f tok/s), drafts accepted %llu of %llu%s", n, reused, n - reused, prompt_ms,
+            prompt_ms > 0 ? 1000.0 * (n - reused) / prompt_ms : 0.0, produced, decode_ms,
+            decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, (unsigned long long)(eng.stats.accepted - acc0),
+            (unsigned long long)(eng.stats.drafted - off0), std::strcmp(finish, "cancel") == 0 ? " (cancelled)" : "");
+        if (Clock::now() - last_save > std::chrono::seconds(60)) {
+            save_profile();
+            last_save = Clock::now();
+        }
     }
+    save_profile();
     return 0;
 }
 
@@ -224,7 +297,8 @@ int serve(Engine& eng) {
 
 int main(int argc, char** argv) {
     EngineOptions opt;
-    opt.profile_path = "data/expert_profile.bin";
+    opt.profile_path = "data/expert-profile-qwen36.bin";
+    ServeOptions so;
     std::string ids_s, dump_logits;
     int n_gen = 32, bench_prompt = 512, selfcheck = 0;
     bool do_serve = false, do_bench = false, spec_check = false;
@@ -236,11 +310,14 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-m" || a == "--model") opt.model_path = next();
-        else if (a == "--ctx") opt.ctx = std::stoi(next());
+        else if (a == "--ctx" || a == "--max-context") opt.ctx = std::stoi(next());
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
-        else if (a == "--reserve-mb") opt.vram_reserve_mb = std::stoll(next());
+        else if (a == "--reserve-mb" || a == "--vram-reserve-mib") opt.vram_reserve_mb = std::stoll(next());
         else if (a == "--cache-mb") opt.cache_mb = std::stoll(next());
-        else if (a == "--profile") opt.profile_path = next();
+        else if (a == "--profile" || a == "--expert-profile") opt.profile_path = next();
+        else if (a == "--profile-save") so.profile_save = next();
+        else if (a == "--ckpt-slots") opt.ckpt_slots = std::stoi(next());
+        else if (a == "--eos-ids") so.eos = parse_ids(next());
         else if (a == "--no-graph") opt.use_graph = false;
         else if (a == "--no-adapt") opt.adapt_every = 0;
         else if (a == "--profile-weight") opt.profile_weight = std::stod(next());
@@ -248,7 +325,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--no-pin") opt.pin_threads = false;
-        else if (a == "--mtp") opt.mtp_draft = std::stoi(next());
+        else if (a == "--mtp" || a == "--mtp-draft") opt.mtp_draft = std::stoi(next());
         else if (a == "--no-mtp") opt.mtp_draft = 0;
         else if (a == "--draft-p") opt.draft_p = std::stof(next());
         else if (a == "--spec-check") spec_check = true;
@@ -268,10 +345,11 @@ int main(int argc, char** argv) {
         else { usage(); die("unknown option %s", a.c_str()); }
     }
     if (opt.model_path.empty()) { usage(); return 1; }
+    if (!so.profile_save.empty() && std::ifstream(so.profile_save).good()) opt.profile_path = so.profile_save;
     Engine eng;
     std::string err;
     if (!eng.init(opt, err)) die("%s", err.c_str());
-    if (do_serve) return serve(eng);
+    if (do_serve) return serve(eng, so);
     if (selfcheck > 1) {
         std::mt19937 rng(7);
         std::vector<int> p;
@@ -390,7 +468,7 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     auto generate = [&] {
         out.clear();
-        eng.begin_request();
+        eng.begin_request(sp);
         std::vector<int> next{eng.sample(sp, rng)};
         for (;;) {
             for (int t : next)

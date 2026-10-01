@@ -1137,7 +1137,11 @@ __global__ void __launch_bounds__(1024) cand_stage2(const float* __restrict__ tm
     }
 }
 
-__global__ void count_token_kernel(uint32_t* counts, const int32_t* token) { counts[*token] += 1; }
+// token[0]: the token entering the penalty window; token[1]: the one leaving it (-1: none)
+__global__ void count_token_kernel(uint32_t* counts, const int32_t* token) {
+    counts[token[0]] += 1;
+    if (token[1] >= 0 && counts[token[1]] > 0) counts[token[1]] -= 1;
+}
 
 }  // namespace
 

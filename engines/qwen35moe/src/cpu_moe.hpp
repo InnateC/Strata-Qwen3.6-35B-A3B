@@ -30,11 +30,18 @@ struct alignas(64) Q8K {
 };
 
 void quantize_q8k(const float* x, Q8K* y, int n);
-/// Dot products of `nb` super-blocks of one weight row against `a` (nb entries).
-float dot_q4k(const void* w, const Q8K* a, int nb);
-float dot_q5k(const void* w, const Q8K* a, int nb);
-float dot_q6k(const void* w, const Q8K* a, int nb);
+/// Dot product of `nb` super-blocks of one weight row against `a` (nb entries).
 float dot_row(uint32_t type, const void* w, const Q8K* a, int nb);
+/// The row dot product of `type` (Q4_K, Q5_K, Q6_K; else the scalar reference), with the kernels in use.
+using DotFn = float (*)(const void* w, const Q8K* a, int nb);
+DotFn dot_fn(uint32_t type);
+/// The instruction set the CPU kernels use: "AVX-512 VNNI" where the CPU and OS have it, else "AVX2".  The first
+/// call decides; STRATA_CPU_ISA=avx2 (or cpu_force_isa) picks the AVX2 kernels on any CPU.
+const char* cpu_isa();
+/// "avx512" or "avx2"; false if this CPU cannot run it.  Before the kernels are used.
+bool cpu_force_isa(const char* name);
+/// True when the CPU runs the AVX2 kernels (AVX2, FMA, F16C and the OS saving the YMM state).
+bool cpu_has_avx2();
 /// Scalar reference: dequantize the row and dot with the dequantized activation.
 float dot_row_ref(uint32_t type, const void* w, const Q8K* a, int nb);
 

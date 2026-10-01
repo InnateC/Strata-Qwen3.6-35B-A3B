@@ -1,5 +1,5 @@
-// test_cpu_kernels.cpp - parity of the AVX-512 expert dot products against scalar dequantization, a full
-// expert-layer check, and CPU MoE throughput.
+// test_cpu_kernels.cpp - parity of the expert dot products against scalar dequantization, a full expert-layer
+// check, and CPU MoE throughput - for each instruction set this CPU runs (AVX-512 VNNI, AVX2).
 //   test_cpu_kernels <model.gguf> [threads]
 #include "common.hpp"
 #include "cpu_moe.hpp"
@@ -24,14 +24,21 @@ int main(int argc, char** argv) {
     std::mt19937 rng(42);
     std::normal_distribution<float> nd(0.f, 1.f);
 
-    // ---------------------------------------------------------------- per-row parity
     int fails = 0;
+    for (const char* isa : {"avx512", "avx2"}) {
+    if (!cpu_force_isa(isa)) {
+        log("== %s: not supported by this CPU, skipped", isa);
+        continue;
+    }
+    log("== %s kernels", cpu_isa());
+    // ---------------------------------------------------------------- per-row parity
     struct Case { int layer; const char* name; int cols; };
     std::vector<Case> cases;
     for (int il = 0; il < 40; ++il) {
         const auto& g = f.need(blk(il, "ffn_gate_exps.weight"));
         const auto& d = f.need(blk(il, "ffn_down_exps.weight"));
         static bool seen_g[32] = {}, seen_d[32] = {};
+        if (il == 0) std::fill(seen_g, seen_g + 32, false), std::fill(seen_d, seen_d + 32, false);
         if (!seen_g[g.type]) { seen_g[g.type] = true; cases.push_back({il, "ffn_gate_exps.weight", 2048}); }
         if (!seen_d[d.type]) { seen_d[d.type] = true; cases.push_back({il, "ffn_down_exps.weight", 512}); }
     }
@@ -142,6 +149,7 @@ int main(int argc, char** argv) {
         }
     }
     moe.stop();
+    }
     log(fails ? "FAILED (%d)" : "all passed", fails);
     return fails ? 1 : 0;
 }

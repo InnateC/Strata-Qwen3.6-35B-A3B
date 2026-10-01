@@ -120,6 +120,7 @@ void k_combine(float* x, const float* moe_gpu, const float* sh_out, const float*
 void k_argmax(const float* logits, int n, int32_t* out_dev, int T, cudaStream_t s, float* prob_dev = nullptr);
 void k_candidates(const float* logits, int n, const uint32_t* counts, SamplePen pen, float* tmp, Candidates* out_dev,
                   cudaStream_t s);
+/// counts[token[0]] += 1, and counts[token[1]] -= 1 when token[1] >= 0 (the token leaving the penalty window).
 void k_count_token(uint32_t* counts, const int32_t* token, cudaStream_t s);
 
 // ---- expert cache maintenance

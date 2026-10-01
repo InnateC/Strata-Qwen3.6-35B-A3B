@@ -41,7 +41,7 @@ struct EngineOptions {
     int adapt_every = 32;            // decode steps between cache adaptation rounds (0 = off)
     int adapt_swaps = 24;            // max experts swapped in per round
     double profile_weight = 1.0;    // loaded profile vs live routing counts (see setup_cache)
-    int ckpt_slots = 2;              // prefix-reuse checkpoints (delta-net state copies, ~63 MiB each)
+    int ckpt_slots = 3;              // prefix-reuse checkpoints (delta-net state copies, ~66 MiB each)
     int mtp_draft = 3;               // speculative tokens drafted per step by the MTP block (0 = off; max kMaxT - 1)
     float draft_p = 0.8f;            // keep drafting while the MTP's probability of all drafts so far is >= this
                                      // (half of it for the first draft; below that the step is a plain one)
@@ -56,7 +56,12 @@ struct SamplingParams {
     float presence_penalty = 0.0f;
     float frequency_penalty = 0.0f;
     float repetition_penalty = 1.0f;
+    int penalty_last_n = 64;    // the penalties count the last N tokens (prompt and output), as llama.cpp does
     uint64_t seed = 0;
+    bool greedy() const {
+        return temperature <= 0.0f && presence_penalty == 0.0f && frequency_penalty == 0.0f && repetition_penalty == 1.0f;
+    }
+    bool penalized() const { return presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f; }
 };
 
 struct EngineStats {
@@ -92,8 +97,8 @@ public:
     void feed(const int* tokens, int n);
     /// Sample the next token from the current logits.
     int sample(const SamplingParams& sp, std::mt19937_64& rng);
-    /// Start of a request: reset penalty counters.
-    void begin_request();
+    /// Start of a request (after the prompt is fed): the penalty window starts with the prompt's last tokens.
+    void begin_request(const SamplingParams& sp);
 
     /// True when the MTP block is loaded and drafting is on.
     bool mtp() const { return mtp_on_; }
@@ -110,7 +115,9 @@ public:
     int reuse_prefix(const std::vector<int>& prompt);
     /// Remember the current state in a checkpoint slot (least recently used one).  The delta-net state cannot be
     /// rolled back, so the server checkpoints the positions a follow-up request is likely to resume from.
-    void save_checkpoint();
+    /// `base`: the end of the system message, which new conversations share - it gets a slot of its own (with 2+
+    /// slots) instead of being pushed out by the turns of one long conversation.
+    void save_checkpoint(bool base = false);
 
     /// Expert profile (routing frequencies seen so far, including the loaded profile) -> file.
     bool save_profile(const std::string& path, std::string& err);
@@ -118,8 +125,13 @@ public:
     EngineStats stats;
     const Model& model() const { return model_; }
     int64_t cache_slots() const { return cache_slots_total_; }
+    int ckpt_slots() const { return (int)ckpts_.size(); }
     double cache_gib() const { return cache_bytes_ / 1073741824.0; }
     std::string status_line() const;
+    /// Distinct experts the decode steps found resident in VRAM / computed by the CPU, since the start.
+    void expert_counts(uint64_t& resident, uint64_t& missing) const;
+    int64_t expert_arena_bytes() const { return model_.expert_bytes; }
+    int cpu_threads() const { return cpu_ ? cpu_->threads() : 0; }
 
     // --- debugging
     std::vector<float> debug_hidden();   // copy of the current residual stream x (fp32)
@@ -147,6 +159,8 @@ private:
     void commit_step(const int* toks, int a, int T);
     void adapt_cache();
     void apply_swap(int layer, int slot, int expert);
+    /// Counts a sampled token for the penalties (and drops the one that leaves the window); stream-ordered.
+    void count_sampled(int tok);
 
     EngineOptions opt_;
     Model model_;
@@ -192,7 +206,9 @@ private:
     HitList* hits_ = nullptr;
     ActQ xq_, yq_, shq_, hq_;
     uint32_t* route_counts_ = nullptr;   // [n_layer][256] (device, cumulative)
-    uint32_t* tok_counts_ = nullptr;     // [vocab] generated-token counts for penalties
+    uint32_t* tok_counts_ = nullptr;     // [vocab] token counts of the penalty window
+    std::vector<int> pen_hist_;          // the tokens counted, oldest first (the window is the last pen_n_)
+    int pen_n_ = 0;
 
     // state
     std::vector<uint16_t*> kc_, vc_;          // per layer (null for delta-net layers)

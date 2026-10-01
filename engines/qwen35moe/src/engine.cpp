@@ -673,8 +673,7 @@ void Engine::spec_step(int tok, const SamplingParams& sp, std::mt19937_64& rng, 
     // ---- accept: row i of the logits predicts the token after toks[i]
     int a = 0;         // tokens of the step kept (tok + accepted drafts)
     int bonus = -1;    // the trunk's own token after them
-    const bool greedy = sp.temperature <= 0.0f && sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
-                        sp.repetition_penalty == 1.0f;
+    const bool greedy = sp.greedy();
     for (int i = 0; i < T; ++i) {
         a = i + 1;
         int t;
@@ -689,8 +688,7 @@ void Engine::spec_step(int tok, const SamplingParams& sp, std::mt19937_64& rng, 
             t = i < D ? sample_speculative(*cand_host_, sp, rng, toks[i + 1], acc) : sample_candidates(*cand_host_, sp, rng);
             // count it for the penalties of the following rows (in stream order before their candidates; the id
             // is read from mapped memory, which is rewritten only after the next synchronisation)
-            tok_host_[2] = t;
-            k_count_token(tok_counts_, tok_dev_ + 2, stream_);
+            count_sampled(t);
         }
         if (!acc) { bonus = t; break; }
     }
@@ -771,15 +769,38 @@ void Engine::reset() {
     mtp_k_ = 0;
 }
 
-void Engine::begin_request() {
-    CUDA_CHECK(cudaMemsetAsync(tok_counts_, 0, (size_t)model_.cfg.n_vocab * 4, stream_));
+void Engine::begin_request(const SamplingParams& sp) {
+    pen_n_ = sp.penalized() ? (sp.penalty_last_n > 0 ? sp.penalty_last_n : opt_.ctx) : 0;
+    pen_hist_.clear();
+    if (pen_n_ == 0) return;
+    const int from = std::max(0, (int)history_.size() - pen_n_);
+    pen_hist_.assign(history_.begin() + from, history_.end());
+    std::vector<uint32_t> c((size_t)model_.cfg.n_vocab, 0);
+    for (int t : pen_hist_) ++c[(size_t)t];
+    CUDA_CHECK(cudaMemcpyAsync(tok_counts_, c.data(), c.size() * 4, cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void Engine::count_sampled(int tok) {
+    if (pen_n_ == 0) return;
+    pen_hist_.push_back(tok);
+    const int n = (int)pen_hist_.size();
+    tok_host_[2] = tok;
+    tok_host_[3] = n > pen_n_ ? pen_hist_[(size_t)(n - 1 - pen_n_)] : -1;
+    k_count_token(tok_counts_, tok_dev_ + 2, stream_);
+}
+
+void Engine::expert_counts(uint64_t& resident, uint64_t& missing) const {
+    unsigned long long ec[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpy(ec, ecount_, 16, cudaMemcpyDeviceToHost));
+    resident = ec[0];
+    missing = ec[1];
 }
 
 int Engine::sample(const SamplingParams& sp, std::mt19937_64& rng) {
     SQ_CHECK(logits_valid_, "sample() without logits");
     int tok;
-    if (sp.temperature <= 0.0f && sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
-        sp.repetition_penalty == 1.0f) {
+    if (sp.greedy()) {
         k_argmax(logits_, model_.cfg.n_vocab, tok_dev_, 1, stream_);
         CUDA_CHECK(cudaStreamSynchronize(stream_));
         tok = tok_host_[0];
@@ -790,8 +811,7 @@ int Engine::sample(const SamplingParams& sp, std::mt19937_64& rng) {
         tok = sample_candidates(*cand_host_, sp, rng);
     }
     // count it for the penalties: the kernel reads the id from mapped host memory
-    tok_host_[2] = tok;
-    k_count_token(tok_counts_, tok_dev_ + 2, stream_);
+    count_sampled(tok);
     return tok;
 }
 
@@ -831,12 +851,15 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
     return n_past_;
 }
 
-void Engine::save_checkpoint() {
-    Checkpoint* slot = &ckpts_[0];
-    for (auto& ck : ckpts_) {
+void Engine::save_checkpoint(bool base) {
+    // slot 0 is the base slot when there are two or more; the others rotate (least recently used)
+    const size_t first = ckpts_.size() > 1 && !base ? 1 : 0;
+    for (auto& ck : ckpts_)
         if (ck.tokens == history_) { ck.stamp = ++ckpt_clock_; return; }
-        if (ck.stamp < slot->stamp) slot = &ck;
-    }
+    Checkpoint* slot = &ckpts_[first];
+    if (!base || ckpts_.size() == 1)
+        for (size_t i = first; i < ckpts_.size(); ++i)
+            if (ckpts_[i].stamp < slot->stamp) slot = &ckpts_[i];
     CUDA_CHECK(cudaMemcpyAsync(slot->arena, state_arena_, state_floats_ * 4, cudaMemcpyDeviceToDevice, stream_));
     CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * model_.cfg.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));

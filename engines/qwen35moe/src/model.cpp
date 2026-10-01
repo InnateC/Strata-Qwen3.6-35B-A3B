@@ -267,7 +267,9 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
         const GgufTensor& d = gguf.need(blk(il, "ffn_down_exps.weight"));
         SQ_CHECK(g.type == u.type, "layer %d: gate/up types differ", il);
         for (uint32_t t : {g.type, d.type})
-            SQ_CHECK(t == T_Q4_K || t == T_Q5_K || t == T_Q6_K || t == T_Q8_0, "layer %d: unsupported expert type %s", il, type_name(t));
+            // the CPU (cpu_avx*.cpp) and GPU (kernels.cu, prefill.cu) expert kernels exist for these three
+            SQ_CHECK(t == T_Q4_K || t == T_Q5_K || t == T_Q6_K,
+                     "layer %d: experts stored as %s; this engine computes Q4_K, Q5_K and Q6_K experts", il, type_name(t));
         SQ_CHECK(g.ne[0] == c.n_embd && g.ne[1] == c.n_ff_exp && d.ne[0] == c.n_ff_exp && d.ne[1] == c.n_embd, "expert shape");
         L.t_gu = g.type;
         L.t_down = d.type;
@@ -276,6 +278,9 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
         L.blob_bytes = 2 * L.gu_bytes + L.down_bytes;
         expert_bytes += L.blob_bytes * c.n_expert;
     }
+    // "expert arena:" and "loaded ... GiB at" are what serve/server.py narrates while the engine starts
+    log("expert arena: %.2f GiB of pinned RAM for %d layers x %d experts", expert_bytes / 1073741824.0,
+        c.n_moe_layers(), c.n_expert);
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
         uint8_t* p = nullptr;
@@ -301,7 +306,9 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
             std::memcpy(dst + 2 * L.gu_bytes, d + e * L.down_bytes, (size_t)L.down_bytes);
         }, 16);
     }
-    log("experts in pinned RAM: %.2f GiB (%.1f s)", expert_bytes / 1073741824.0, (now_ms() - t1) / 1000);
+    const double secs = (now_ms() - t1) / 1000;
+    log("experts loaded %.2f GiB at %.1f GiB/s (%.1f s)", expert_bytes / 1073741824.0,
+        secs > 0 ? expert_bytes / 1073741824.0 / secs : 0.0, secs);
     return true;
 }
 

@@ -14,7 +14,7 @@ import tempfile
 
 import numpy as np
 
-EXE = os.environ.get("STRATAQ_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "..", "engine-qwen35moe",
+EXE = os.environ.get("STRATA_QWEN35MOE_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "..", "engine-qwen35moe",
                                                    "strata-qwen35moe.exe" if os.name == "nt" else "strata-qwen35moe")
 
 

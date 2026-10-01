@@ -4,10 +4,20 @@
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
 
 > **Strata-Qwen36 (this fork) runs [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**
-> (Unsloth's UD-Q4_K_M with its MTP layer; ~200 tokens/s on an RTX 5080 16 GB with 64 GB of RAM): `START-HERE.bat`
+> (Unsloth's UD-Q4_K_M with its MTP layer; ~190 tokens/s on an RTX 5080 16 GB with 64 GB of RAM): `START-HERE.bat`
 > (`./setup.sh`) sets it up and serves it on port 8081, side by side with an upstream Strata if you have one. See
 > **[docs/QWEN36.md](docs/QWEN36.md)**. The rest of this README is upstream's, for Qwen3.8-Flash-Next
 > (`START-HERE.bat --flash-next`).
+>
+> Against llama.cpp on the same PC (RTX 5080 16 GB, Ryzen 7 9800X3D, 64 GB; the same GGUF and requests; llama.cpp
+> tuned per row - `--n-cpu-moe`, its MTP drafting, `-ub 2048`; [details](bench/results/2026-10-01-qwen36-vs-llamacpp/README.md)):
+>
+> | tokens/s | Strata-Qwen36 | llama.cpp (best) | |
+> | --- | ---: | ---: | ---: |
+> | Output, short chat | **187.6** | 94.7 | 2.0x |
+> | Output after a 28.7K-token prompt | **157.3** | 98.6 | 1.6x |
+> | Reading a 7.9K-token prompt | **3,269** | 2,283 | 1.4x |
+> | Reading a 29.8K-token prompt | **2,196** | 2,156 | 1.0x |
 
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·

@@ -17,6 +17,20 @@ RTX 5080 (16 GB), Ryzen 7 9800X3D (8 cores, AVX-512), 64 GB DDR5, Windows 11, UD
 | Reading the prompt | 8K: 3,550 · 31K: 2,260 · 61K: 1,520 tok/s |
 | Start (load) | 5-7 s; ~20 GB of RAM in use while it runs |
 
+**Against llama.cpp** on the same PC, with the same GGUF and the same requests (greedy, no prefix reuse), llama.cpp
+tuned per row (`--n-cpu-moe`, `--spec-type draft-mtp`, `-ub 2048`):
+
+| tokens/s | Strata-Qwen36 | llama.cpp | llama.cpp + MTP | llama.cpp + MTP, `-ub 2048` |
+| --- | ---: | ---: | ---: | ---: |
+| Output, short chat | **187.6** | 84.1 | 94.7 | 90.8 |
+| Output after a 28.7K-token prompt | **157.3** | 77.6 | 98.6 | 87.8 |
+| Reading a 7.9K-token prompt | **3,269** | 1,011 | 911 | 2,283 |
+| Reading a 29.8K-token prompt | **2,196** | 1,000 | 898 | 2,156 |
+
+How it was measured, every request and the llama.cpp settings tried:
+[bench/results/2026-10-01-qwen36-vs-llamacpp](../bench/results/2026-10-01-qwen36-vs-llamacpp/README.md)
+(`tools/bench_vs_llamacpp.py`).
+
 The MTP drafts are accepted 75-95% of the time, depending on the text. Needle-in-a-haystack
 (`tools/needle_bench.py --url http://127.0.0.1:8081 --lengths 8k,32k,64k`): 9 of 9 found.
 

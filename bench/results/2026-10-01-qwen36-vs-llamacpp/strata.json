@@ -1,0 +1,130 @@
+{
+ "label": "strata",
+ "decode": [
+  {
+   "prompt_tokens": 44,
+   "completion_tokens": 384,
+   "prompt_per_second": 178.3,
+   "predicted_per_second": 201.4,
+   "draft_n": 281,
+   "draft_n_accepted": 228,
+   "wall_s": 2.1796817779541016
+  },
+  {
+   "prompt_tokens": 38,
+   "completion_tokens": 384,
+   "prompt_per_second": 164.4,
+   "predicted_per_second": 155.9,
+   "draft_n": 281,
+   "draft_n_accepted": 232,
+   "wall_s": 2.6980652809143066
+  },
+  {
+   "prompt_tokens": 33,
+   "completion_tokens": 384,
+   "prompt_per_second": 149.5,
+   "predicted_per_second": 152.5,
+   "draft_n": 296,
+   "draft_n_accepted": 258,
+   "wall_s": 2.7530806064605713
+  },
+  {
+   "prompt_tokens": 43,
+   "completion_tokens": 384,
+   "prompt_per_second": 180.2,
+   "predicted_per_second": 227.3,
+   "draft_n": 281,
+   "draft_n_accepted": 230,
+   "wall_s": 1.929795742034912
+  },
+  {
+   "prompt_tokens": 37,
+   "completion_tokens": 384,
+   "prompt_per_second": 148.3,
+   "predicted_per_second": 186.5,
+   "draft_n": 280,
+   "draft_n_accepted": 223,
+   "wall_s": 2.31927752494812
+  },
+  {
+   "prompt_tokens": 36,
+   "completion_tokens": 384,
+   "prompt_per_second": 146.2,
+   "predicted_per_second": 202.0,
+   "draft_n": 290,
+   "draft_n_accepted": 258,
+   "wall_s": 2.1609325408935547
+  }
+ ],
+ "long": [
+  {
+   "prompt_tokens": 28668,
+   "completion_tokens": 400,
+   "prompt_per_second": 2299.6,
+   "predicted_per_second": 150.3,
+   "draft_n": 311,
+   "draft_n_accepted": 262,
+   "wall_s": 15.216450929641724
+  },
+  {
+   "prompt_tokens": 28668,
+   "completion_tokens": 400,
+   "prompt_per_second": 2317.7,
+   "predicted_per_second": 164.2,
+   "draft_n": 303,
+   "draft_n_accepted": 257,
+   "wall_s": 14.896577835083008
+  }
+ ],
+ "prefill": {
+  "8k": [
+   {
+    "prompt_tokens": 7860,
+    "completion_tokens": 2,
+    "prompt_per_second": 3275.7,
+    "predicted_per_second": 50.5,
+    "draft_n": 3,
+    "draft_n_accepted": 3,
+    "wall_s": 2.4749457836151123
+   },
+   {
+    "prompt_tokens": 7861,
+    "completion_tokens": 2,
+    "prompt_per_second": 3262.9,
+    "predicted_per_second": 73.5,
+    "draft_n": 3,
+    "draft_n_accepted": 3,
+    "wall_s": 2.4599013328552246
+   }
+  ],
+  "32k": [
+   {
+    "prompt_tokens": 29794,
+    "completion_tokens": 3,
+    "prompt_per_second": 2208.6,
+    "predicted_per_second": 102.7,
+    "draft_n": 3,
+    "draft_n_accepted": 3,
+    "wall_s": 13.59638524055481
+   },
+   {
+    "prompt_tokens": 29793,
+    "completion_tokens": 3,
+    "prompt_per_second": 2183.1,
+    "predicted_per_second": 110.3,
+    "draft_n": 3,
+    "draft_n_accepted": 3,
+    "wall_s": 13.755759239196777
+   }
+  ]
+ },
+ "summary": {
+  "decode_tok_s": 187.6,
+  "long_prompt_tokens": 28668,
+  "long_decode_tok_s": 157.25,
+  "prefill_8k_tokens": 7860.5,
+  "prefill_32k_tokens": 29793.5,
+  "prefill_8k_tok_s": 3269.3,
+  "prefill_32k_tok_s": 2195.85
+ }
+}

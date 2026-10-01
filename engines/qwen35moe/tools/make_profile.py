@@ -1,23 +1,31 @@
-"""tools/make_profile.py - build data/expert_profile.bin, the routing profile the VRAM expert cache starts from.
+"""engines/qwen35moe/tools/make_profile.py - build the routing profile the VRAM expert cache starts from
+(data/expert-profile-qwen36.bin).
 
 Runs a small, varied chat workload (Japanese / English / Chinese; code, math, writing, knowledge, tool calls; thinking
-on and off) through the engine with the server's default sampling, then asks the engine to save its routing counts.
-Generated tokens dominate the counts, which is what matters: the cache only serves decode (prefill streams experts).
+on and off) through the engine with Qwen's recommended sampling, then quits it, which saves its routing counts
+(--profile-save).  Generated tokens dominate the counts, which is what matters: the cache only serves decode (prefill
+streams experts).
 
-    python tools/make_profile.py [--out data/expert_profile.bin] [--max-new 768] [--limit N]
+    python engines/qwen35moe/tools/make_profile.py --model <gguf> --tokenizer <dir> [--out FILE] [--max-new 768]
+    python engines/qwen35moe/tools/make_profile.py ... --eval --profile data/expert-profile-qwen36.bin   (measure one)
 
-Starts from a uniform cache and an empty profile, so the output reflects this workload only.  The server keeps adding
-its own traffic to the profile when it exits (see Engine::save_profile).
+Starts from a uniform cache and an empty profile, so the output reflects this workload only.  A running server keeps
+adding its own traffic to its copy of the profile (setup's --profile-save file).
 """
 import argparse
+import json
 import os
 import sys
+import threading
 import time
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "serve"))
-from server import ChatTemplate, Engine, default_model  # noqa: E402
-from tokenizer import Tokenizer  # noqa: E402
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tools"))
+import strata_tokenizer as ST  # noqa: E402
+from serve.frontend import ChatTemplate  # noqa: E402
+from serve.server import StrataEngine  # noqa: E402
 
 WEATHER_TOOL = {"type": "function", "function": {
     "name": "get_weather", "description": "Get the current weather for a city.",
@@ -96,28 +104,42 @@ EVAL_PROMPTS = [
 ]
 
 
+def load_tokenizer(tdir: Path):
+    vocab = json.loads((tdir / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    return ST.Tokenizer(tokens, (tdir / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                        json.loads((tdir / "token_type.json").read_text()))
+
+
 def main():
+    exe = "strata-qwen35moe.exe" if os.name == "nt" else "strata-qwen35moe"
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=default_model())
-    ap.add_argument("--exe", default=os.path.join(ROOT, "build", "Release", "strataq.exe" if os.name == "nt" else "strataq"))
-    ap.add_argument("--out", default=os.path.join(ROOT, "data", "expert_profile.bin"))
+    ap.add_argument("--model", required=True, help="the GGUF")
+    ap.add_argument("--tokenizer", required=True, help="the tokenizer directory setup exported (packs/<tag>/tokenizer)")
+    ap.add_argument("--exe", default=str(REPO / "engine-qwen35moe" / exe))
+    ap.add_argument("--out", default=str(REPO / "data" / "expert-profile-qwen36.bin"))
     ap.add_argument("--max-new", type=int, default=768)
     ap.add_argument("--limit", type=int, default=0, help="only the first N prompts (testing)")
     ap.add_argument("--only", default="", help="comma-separated 1-based job numbers (testing)")
-    ap.add_argument("--profile", default="", help="start from this profile (with --no-save: measure it)")
+    ap.add_argument("--profile", default="", help="start from this profile (with --eval: measure it)")
     ap.add_argument("--adapt", action="store_true", help="let the cache adapt while running")
-    ap.add_argument("--no-save", action="store_true")
     ap.add_argument("--eval", action="store_true", help="run the held-out prompts, adapt on, do not save")
-    ap.add_argument("--engine-args", default="", help="extra strataq arguments")
+    ap.add_argument("--engine-args", default="", help="extra engine arguments")
     a = ap.parse_args()
     if a.eval:
-        a.adapt, a.no_save = True, True
-
-    tok = Tokenizer.from_model(a.model)
-    tpl = ChatTemplate(tok.chat_template)
-    eng = Engine(a.exe, ["-m", a.model, "--ctx", "8192", "--profile", a.profile] + ([] if a.adapt else ["--no-adapt"]) + a.engine_args.split(),
-                 os.path.join(ROOT, "make_profile.log"))
-    stop = [i for i in (tok.id_im_end, tok.id_endoftext) if i is not None]
+        a.adapt = True
+    tdir = Path(a.tokenizer)
+    tok = load_tokenizer(tdir)
+    tpl = ChatTemplate(tdir / "chat_template.jinja")
+    args = ["-m", a.model, "--max-context", "8192", "--expert-profile", a.profile] + \
+        ([] if a.adapt else ["--no-adapt"]) + a.engine_args.split()
+    out = Path(a.out)
+    if not a.eval:
+        out.unlink(missing_ok=True)                 # --profile-save reads an existing file as its starting profile
+        args += ["--profile-save", str(out)]
+    eng = StrataEngine(a.exe, args, log=str(REPO / "make_profile.log"))
     jobs = [(p, None, i % 3 != 2) for i, p in enumerate(PROMPTS)] + [(p, t, True) for p, t in TOOL_PROMPTS]
     if a.eval:
         jobs = [(p, None, i % 2 == 0) for i, p in enumerate(EVAL_PROMPTS)]
@@ -126,40 +148,24 @@ def main():
         order = [int(x) - 1 for x in a.only.split(",")]
     elif a.limit:
         order = order[:a.limit]
-    total = 0
-    t0 = time.time()
+    total, t0, never = 0, time.time(), threading.Event()
     for i in order:
         prompt, tools, think = jobs[i]
-        text = tpl.render([{"role": "user", "content": prompt}], tools=tools, enable_thinking=think)
-        ids = tok.encode(text)
-        sp = ({"temp": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "pres": 1.5} if think else
-              {"temp": 0.7, "top_k": 20, "top_p": 0.8, "min_p": 0.0, "pres": 1.5})
-        sp.update(max_new=a.max_new, seed=1000 + i)
-        n = 0
-        info = {}
-        for ev in eng.generate(ids, sp, stop, cancel=_Never()):
-            if ev[0] == "tok":
-                n += 1
-            elif ev[0] == "done":
-                info = ev[1]
+        text = tpl.render([{"role": "user", "content": prompt}], tools=[t["function"] for t in tools or []] or None,
+                          enable_thinking=think)
+        ids = tok.encode(text, parse_special=True)
+        sp = ({"temperature": 1.0, "top_k": 20, "top_p": 0.95, "presence_penalty": 1.5} if think else
+              {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "presence_penalty": 1.5})
+        sp["seed"] = 1000 + i
+        n = sum(1 for t in eng.generate(ids, a.max_new, sp, never) if t is not None)
         total += n
-        dm = float(info.get("decode_ms", 0)) or 1.0
+        dm = float(eng.last.get("decode_ms", 0)) or 1.0
         print(f"[{i + 1:2d}/{len(jobs)}] {len(ids):4d} + {n:4d} tokens  {n * 1000 / dm:6.1f} tok/s  "
               f"{'think' if think else 'plain'}{' tools' if tools else ''}  {prompt[:40]!r}", flush=True)
-    print(eng.command("STATS"))
     print(f"{total} generated tokens in {time.time() - t0:.0f} s")
-    if not a.no_save:
-        r = eng.command(f"SAVEPROFILE {a.out}")
-        if r != "OK":
-            sys.exit(f"SAVEPROFILE failed: {r}")
-        print(f"profile written to {a.out}")
-    eng._send("QUIT")
-
-
-class _Never:
-    @staticmethod
-    def is_set():
-        return False
+    eng.close()                                     # QUIT: the engine writes --profile-save
+    if not a.eval:
+        print(f"profile written to {out}" if out.exists() else f"the engine did not write {out}")
 
 
 if __name__ == "__main__":

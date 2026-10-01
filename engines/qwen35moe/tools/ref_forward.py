@@ -1,10 +1,10 @@
-"""tools/ref_forward.py - a plain numpy forward pass of qwen35moe, the float reference for parity.
+"""engines/qwen35moe/tools/ref_forward.py - a plain numpy forward pass of qwen35moe, the float reference for parity.
 
 Weights are the GGUF's quantized weights, dequantized to float32; every activation stays in float32/64, so this
 is the model the quantized weights DEFINE, without any engine's activation quantization.  Slow (seconds per token)
 and only meant for short prompts.
 
-    python tools/ref_forward.py MODEL.gguf 760,6511,314,9338,369 [out_logits.npy]
+    python engines/qwen35moe/tools/ref_forward.py MODEL.gguf 760,6511,314,9338,369 [out_logits.npy]
 """
 import sys
 

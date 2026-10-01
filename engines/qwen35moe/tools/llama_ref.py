@@ -1,9 +1,10 @@
-"""tools/llama_ref.py - capture reference outputs from a running llama-server (the oracle) for parity tests.
+"""engines/qwen35moe/tools/llama_ref.py - capture reference outputs from a running llama-server (the oracle) for
+parity tests.
 
-    python tools/llama_ref.py http://127.0.0.1:8099 data/ref_llama.json
+    python engines/qwen35moe/tools/llama_ref.py http://127.0.0.1:8099 ref_llama.json
 
 For each prompt: the token ids, llama.cpp's greedy continuation and the top-10 probabilities of the first
-generated token.  tools/parity.py later runs the same ids through strataq and compares.
+generated token.  tools/parity.py later runs the same ids through the engine and compares.
 """
 import json
 import sys

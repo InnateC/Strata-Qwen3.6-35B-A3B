@@ -1,6 +1,6 @@
-"""tools/parity.py - compare strataq against the llama.cpp reference captured by tools/llama_ref.py.
+"""engines/qwen35moe/tools/parity.py - compare the engine against the llama.cpp reference captured by llama_ref.py.
 
-    python tools/parity.py models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf data/ref_llama.json [extra strataq args]
+    python engines/qwen35moe/tools/parity.py <model.gguf> ref_llama.json [extra engine args]
 
 Per prompt: how many greedy tokens agree with llama.cpp, and the first token's top-10 log-probabilities
 (max |difference|).  Exact agreement is not required - the two engines quantize activations differently -
@@ -14,7 +14,8 @@ import tempfile
 
 import numpy as np
 
-EXE = os.environ.get("STRATAQ_EXE") or os.path.join(os.path.dirname(__file__), "..", "build", "Release", "strataq.exe")
+EXE = os.environ.get("STRATAQ_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "..", "engine-qwen35moe",
+                                                   "strata-qwen35moe.exe" if os.name == "nt" else "strata-qwen35moe")
 
 
 def main():
